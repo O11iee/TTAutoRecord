@@ -1,5 +1,5 @@
 #![allow(deprecated)]
-use reqwest::{self, Client};
+use reqwest::{self, Client, header};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,12 +16,15 @@ use std::process::Stdio;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use std::fs::metadata;
+use std::str::FromStr;
+
 
 static IPHONE_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1";
 static FFMPEG_PATH: &str = "ffmpeg.exe";
 static LOCK_DIRECTORY: &str = "../lock_files";
-static RE_M3U8: Lazy<Regex> = Lazy::new(|| Regex::new("https://[^'\"]+\\.m3u8(?:\\?.*)?").unwrap());
-static RE_FLV: Lazy<Regex> = Lazy::new(|| Regex::new(r#""([^"]+\.flv(?:\?.*)?)"#).unwrap());
+static RE_M3U8: Lazy<Regex> = Lazy::new(|| Regex::new(r#""hls_pull_url":\s*"([^"]+)"#).unwrap());
+static RE_FLV: Lazy<Regex> = Lazy::new(|| Regex::new(r#""rtmp_pull_url":\s*"([^"]+)"#).unwrap());
+
 
 static RE_USERNAME: Lazy<Regex> = Lazy::new(|| Regex::new(r#""display_id":"([^"]+)""#).unwrap());
 
@@ -94,57 +97,65 @@ async fn clear_lock_files_directory() -> Result<(), Box<dyn std::error::Error>> 
 async fn fetch_room_info_and_extract(client: &Client, room_id: &str, state: Arc<Mutex<HashMap<String, String>>>) -> Result<FetchResult, Box<dyn Error>> {
     let _current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let url = format!("https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={}", room_id);
-    let response = timeout(Duration::from_secs(10), client.get(&url).send()).await??;
+
+    // Creating custom headers
+    let mut custom_headers = header::HeaderMap::new();
+    custom_headers.insert(header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".parse().unwrap());
+    custom_headers.insert(header::ACCEPT_LANGUAGE, "en-GB,en-US;q=0.9,en;q=0.8".parse().unwrap());
+    custom_headers.insert(header::CACHE_CONTROL, "max-age=0".parse().unwrap());
+    custom_headers.insert(header::DNT, "1".parse().unwrap());
+
+    // Inserting custom headers
+    custom_headers.insert(header::HeaderName::from_str("sec-ch-ua").unwrap(), "\"Chromium\";v=\"117\", \"Not;A=Brand\";v=\"8\"".parse().unwrap());
+    custom_headers.insert(header::HeaderName::from_str("sec-ch-ua-mobile").unwrap(), "?0".parse().unwrap());
+    custom_headers.insert(header::HeaderName::from_str("sec-ch-ua-platform").unwrap(), "\"Windows\"".parse().unwrap());
+    custom_headers.insert(header::HeaderName::from_str("sec-fetch-dest").unwrap(), "document".parse().unwrap());
+    custom_headers.insert(header::HeaderName::from_str("sec-fetch-mode").unwrap(), "navigate".parse().unwrap());
+    custom_headers.insert(header::HeaderName::from_str("sec-fetch-site").unwrap(), "none".parse().unwrap());
+    custom_headers.insert(header::HeaderName::from_str("sec-fetch-user").unwrap(), "?1".parse().unwrap());
+
+    custom_headers.insert(header::UPGRADE_INSECURE_REQUESTS, "1".parse().unwrap());
+    custom_headers.insert(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36".parse().unwrap());
+
+    let response = timeout(Duration::from_secs(10), client.get(&url).headers(custom_headers).send()).await??;
+
     if response.status() == reqwest::StatusCode::NOT_FOUND {
+        //println!("{}: Room not found: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), room_id);
         return Ok(FetchResult::NotFound);
     }
-    let content = response.bytes().await?;
-    let text: std::borrow::Cow<'_, str> = String::from_utf8_lossy(&content);
-    let mut state = state.lock().await;
 
-    async fn check_and_return_first_working_url(client: &Client, urls: Vec<String>) -> Option<String> {
-        for url in &urls {
-            let response = client.get(url).send().await;
-            if let Ok(response) = response {
-                if response.status().is_success() {
-                    let url_actual = response.url().to_string();
-                    return Some(url_actual);
-                }
-            }
-        }
-        None
-    }
+    let content = response.bytes().await?;
+    let text = String::from_utf8_lossy(&content);
+
+    let mut state_lock = state.lock().await;
 
     if text.contains("\"status\":2") {
+        //println!("{}: Room live: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), room_id);
+
         if let Some(username_cap) = RE_USERNAME.captures(&text) {
             let username = username_cap[1].to_string();
-            if let Some(m3u8_url) = RE_M3U8.find(&text).map(|m| m.as_str().to_string()) {
-                let response = client.get(&m3u8_url).send().await;
-                if let Ok(response) = response {
-                    if response.status().is_success() {
-                        state.insert(room_id.to_string(), "m3u8".to_string());
-                        return Ok(FetchResult::UrlAndUsername(m3u8_url, username));
-                    }
-                }
-            }
+            //println!("Username found: {}", username);
 
-            let flv_urls: Vec<String> = RE_FLV.captures_iter(&text).map(|cap| cap[1].to_string()).collect();
-            let (uhd_flv_urls, flv_urls): (Vec<String>, Vec<String>) = flv_urls.into_iter().partition(|url| url.contains("_uhd.flv"));
+            let m3u8_url = RE_M3U8.captures(&text).and_then(|cap| cap.get(1)).map(|m| m.as_str().to_string());
+            let flv_url = RE_FLV.captures(&text).and_then(|cap| cap.get(1)).map(|m| m.as_str().to_string());
 
-            if let Some(uhd_flv_url) = check_and_return_first_working_url(client, uhd_flv_urls).await {
-                state.insert(room_id.to_string(), "flv".to_string());
-                return Ok(FetchResult::UrlAndUsername(uhd_flv_url, username));
-            } else if let Some(flv_url) = check_and_return_first_working_url(client, flv_urls).await {
-                state.insert(room_id.to_string(), "flv".to_string());
-                return Ok(FetchResult::UrlAndUsername(flv_url, username));
+            //println!("M3U8 URL: {:?}", m3u8_url);
+            //println!("FLV URL: {:?}", flv_url);
+
+            if let Some(url) = m3u8_url.or(flv_url) {
+                //println!("Selected URL: {}", url);
+                state_lock.insert(room_id.to_string(), if url.ends_with(".m3u8") { "m3u8" } else { "flv" }.to_string());
+                return Ok(FetchResult::UrlAndUsername(url, username));
             } else {
+                //println!("No valid URL found");
                 return Ok(FetchResult::LiveEnded);
             }
-            
         } else {
+            //println!("Username not found for room: {}", room_id);
             return Ok(FetchResult::UsernameMissing);
         }
     } else {
+        //println!("Room is not live: {}", room_id);
         return Ok(FetchResult::LiveEnded);
     }
 }
@@ -160,7 +171,7 @@ async fn download_video(client: &reqwest::Client, room_id: &str, state: Arc<Mute
     let fetch_result = fetch_room_info_and_extract(client, room_id, state.clone()).await?;
 
     match fetch_result {
-        FetchResult::UrlAndUsername(url, username) => {
+        FetchResult::UrlAndUsername(mut url, username) => {
             
             let lock_file_path = format!("{}/{}.lock", LOCK_DIRECTORY, username);
             if Path::new(&lock_file_path).exists() {
@@ -181,6 +192,7 @@ async fn download_video(client: &reqwest::Client, room_id: &str, state: Arc<Mute
 
             //println!("{}: {} is live", Local::now().format("%Y-%m-%d %H:%M:%S"), username);
 
+            url = url.replace("\\u0026", "&");
 
             //download video
             tokio::spawn(async move {
@@ -283,10 +295,9 @@ async fn download_video(client: &reqwest::Client, room_id: &str, state: Arc<Mute
             println!("{}: Error retrieving data for {} - You are most likely rate limited! Tweak your config.toml", Local::now().format("%Y-%m-%d %H:%M:%S"), room_id);
         },
         FetchResult::LiveEnded => {
-
         },
         FetchResult::UsernameMissing => {
-
+            println!("{}: Username missing for {}", Local::now().format("%Y-%m-%d %H:%M:%S"), room_id);
         },
     }
 
